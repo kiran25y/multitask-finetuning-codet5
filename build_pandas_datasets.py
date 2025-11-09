@@ -1,35 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Build datasets from pandas-dev/pandas for 4 CodeLLM tasks.
-
-Output directories:
-data/
-├── raw/
-│   ├── repo/                     # cloned pandas
-│   └── mined/
-│       ├── code_search_all_raw.jsonl
-│       ├── code_repair_all_raw.jsonl
-│       ├── code_summarization_all_raw.jsonl
-│       └── signature_generation_all_raw.jsonl
-└── clean_data/
-    ├── code_search.jsonl
-    ├── code_repair.jsonl
-    ├── code_summarization.jsonl
-    └── signature_generation.jsonl
-
-Install:
-  pip install GitPython tqdm rapidfuzz
-"""
-
 from __future__ import annotations
-import argparse
-import ast
-import json
-import random
-import re
-import sys
+import argparse, ast, json, re, sys, textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Dict, Optional
@@ -46,8 +19,7 @@ except Exception:
 try:
     from rapidfuzz import process, fuzz
 except Exception:
-    process = None
-    fuzz = None
+    process = None; fuzz = None
 
 # ----------------------- Paths / Config -----------------------
 DATA_DIR = Path("data")
@@ -59,8 +31,11 @@ CLEAN_DIR = DATA_DIR / "clean_data"
 PY_EXTS = {".py"}
 SKIP_SUBSTRINGS = [
     ".venv", "site-packages", "build/", "dist/", "docs/", "asv_bench/", "benchmarks/",
-    "__pycache__", "typings/", "tests/", "doc/", "doc/source", "scripts/bench"
+    "__pycache__", "typings/", "doc/", "doc/source", "scripts/bench"
 ]
+# We’ll allow mining code from package sources but skip tests by default elsewhere.
+REPAIR_TESTS_SKIP = re.compile(r"(?:^|/)tests?/", re.I)
+
 BUGGY_HINTS = re.compile(r"\b(fix|bug|issue|regress|broken|error|typo|fail|incorrect)\b", re.I)
 
 # ----------------------- Helpers -----------------------
@@ -75,6 +50,17 @@ def write_jsonl(path: Path, rows: Iterable[Dict]):
     with path.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def dedent_strip(s: str) -> str:
+    return textwrap.dedent(s).strip()
+
+def first_sentence(s: str) -> str:
+    # very light heuristic: take first non-empty line, cut at ~sentence end
+    s = s.strip()
+    line = next((ln for ln in s.splitlines() if ln.strip()), "")
+    # cut to 180 chars to avoid overly-long “queries/targets”
+    cut = re.split(r"(?<=[.!?])\s", line, maxsplit=1)[0]
+    return (cut[:180]).strip()
 
 def iter_python_files(root: Path):
     for p in root.rglob("*.py"):
@@ -117,12 +103,9 @@ def extract_functions(py_path: Path) -> List[FuncInfo]:
             vararg = node.args.vararg.arg if node.args.vararg else None
             kwarg = node.args.kwarg.arg if node.args.kwarg else None
             parts = pos[:]
-            if vararg:
-                parts.append("*" + vararg)
-            if node.args.kwonlyargs:
-                parts += [ka.arg + "=…" for ka in node.args.kwonlyargs]
-            if kwarg:
-                parts.append("**" + kwarg)
+            if vararg: parts.append("*" + vararg)
+            if node.args.kwonlyargs: parts += [ka.arg + "=…" for ka in node.args.kwownlyargs] if hasattr(node.args, "kwownlyargs") else [ka.arg + "=…" for ka in node.args.kwonlyargs]
+            if kwarg: parts.append("**" + kwarg)
             sig = f"{node.name}({', '.join(parts)})"
             # body without leading docstring
             if node.body and isinstance(node.body[0], ast.Expr) and isinstance(getattr(node.body[0], "value", None), ast.Constant) and isinstance(node.body[0].value.value, str):
@@ -142,20 +125,20 @@ def extract_functions(py_path: Path) -> List[FuncInfo]:
                 name=node.name,
                 signature=sig,
                 docstring=ds,
-                body_src=body_src,
-                full_src=header_src
+                body_src=dedent_strip(body_src),
+                full_src=dedent_strip(header_src),
             ))
     return out
 
 # ----------------------- Builders -----------------------
-def build_code_summarization(repo_root: Path, min_chars=40) -> List[Dict]:
+def build_code_summarization(repo_root: Path, min_chars=20) -> List[Dict]:
     rows = []
     for f in tqdm(list(iter_python_files(repo_root)), desc="Summarization"):
         for fx in extract_functions(f):
             if not fx.docstring:
                 continue
-            ds = fx.docstring.strip()
-            if len(ds) < min_chars:
+            tgt = first_sentence(fx.docstring)
+            if len(tgt) < min_chars:
                 continue
             inp = f"# file: {fx.file}\n# signature: {fx.signature}\n\n{fx.full_src}"
             rows.append({
@@ -163,15 +146,15 @@ def build_code_summarization(repo_root: Path, min_chars=40) -> List[Dict]:
                 "task": "code_summarization",
                 "language": "python",
                 "input": inp,
-                "target": ds
+                "target": tgt
             })
     return rows
 
-def build_signature_generation(repo_root: Path, min_body=60) -> List[Dict]:
+def build_signature_generation(repo_root: Path, min_body=40) -> List[Dict]:
     rows = []
     for f in tqdm(list(iter_python_files(repo_root)), desc="SignatureGen"):
         for fx in extract_functions(f):
-            body = fx.body_src.strip()
+            body = fx.body_src
             if len(body) < min_body:
                 continue
             rows.append({
@@ -183,7 +166,7 @@ def build_signature_generation(repo_root: Path, min_body=60) -> List[Dict]:
             })
     return rows
 
-def build_code_search(repo_root: Path, min_ds=40, k_neg=3) -> List[Dict]:
+def build_code_search(repo_root: Path, k_neg=3) -> List[Dict]:
     if process is None:
         print("[WARN] rapidfuzz not installed -> code_search will have empty negatives.", file=sys.stderr)
     funcs = []
@@ -192,9 +175,11 @@ def build_code_search(repo_root: Path, min_ds=40, k_neg=3) -> List[Dict]:
     names = [f"{fx.name} in {Path(fx.file).name}" for fx in funcs]
     rows = []
     for fx in tqdm(funcs, desc="Search pairs"):
-        if not fx.docstring or len(fx.docstring.strip()) < min_ds:
+        if not fx.docstring:
             continue
-        query = fx.docstring.strip().split("\n")[0]
+        query = first_sentence(fx.docstring)
+        if not query:
+            continue
         code = fx.full_src
         negs = []
         if process is not None:
@@ -211,11 +196,12 @@ def build_code_search(repo_root: Path, min_ds=40, k_neg=3) -> List[Dict]:
             "language": "python",
             "query": query,
             "positive": code,
-            "negatives": negs
+            "negatives": [dedent_strip(n) for n in negs]
         })
     return rows
 
-def build_code_repair(repo_root: Path, max_commits=3000, context=3, branch="main") -> List[Dict]:
+def build_code_repair(repo_root: Path, max_commits=3000, context=3, branch="main",
+                      include_tests=False) -> List[Dict]:
     if Repo is None:
         print("[ERROR] GitPython not installed: pip install GitPython", file=sys.stderr)
         return []
@@ -233,6 +219,8 @@ def build_code_repair(repo_root: Path, max_commits=3000, context=3, branch="main
         for d in diffs:
             if not d.b_path or not d.b_path.endswith(".py"):
                 continue
+            if (not include_tests) and REPAIR_TESTS_SKIP.search(d.b_path or ""):
+                continue
             patch = d.diff.decode("utf-8", errors="ignore")
             lines = patch.splitlines()
             buggy_chunk, fixed_chunk = [], []
@@ -240,16 +228,22 @@ def build_code_repair(repo_root: Path, max_commits=3000, context=3, branch="main
 
             def flush_pair():
                 nonlocal buggy_chunk, fixed_chunk
-                if buggy_chunk or fixed_chunk:
-                    rows.append({
-                        "id": f"{c.hexsha}:{d.b_path}:{len(rows)}",
-                        "task": "code_repair",
-                        "language": "python",
-                        "meta": {"commit": c.hexsha, "file": d.b_path, "message": (c.message or "").strip()},
-                        "input": "\n".join(buggy_chunk),
-                        "target": "\n".join(fixed_chunk)
-                    })
-                    buggy_chunk, fixed_chunk = [], []
+                bi = dedent_strip("\n".join(buggy_chunk))
+                fi = dedent_strip("\n".join(fixed_chunk))
+                # skip empty & whitespace-only changes
+                if not bi or not fi:
+                    buggy_chunk.clear(); fixed_chunk.clear(); return
+                if bi.replace(" ", "") == fi.replace(" ", ""):
+                    buggy_chunk.clear(); fixed_chunk.clear(); return
+                rows.append({
+                    "id": f"{c.hexsha}:{d.b_path}:{len(rows)}",
+                    "task": "code_repair",
+                    "language": "python",
+                    "meta": {"commit": c.hexsha, "file": d.b_path, "message": (c.message or "").strip()},
+                    "input": bi,
+                    "target": fi
+                })
+                buggy_chunk.clear(); fixed_chunk.clear()
 
             for ln in lines:
                 if ln.startswith("@@"):
@@ -265,7 +259,7 @@ def build_code_repair(repo_root: Path, max_commits=3000, context=3, branch="main
                     if ctx_before:
                         buggy_chunk = ctx_before[-context:] + buggy_chunk
                 else:
-                    ctx_line = ln if not ln.startswith(" ") else ln[1:]
+                    ctx_line = ln[1:] if ln.startswith(" ") else ln
                     ctx_before.append(ctx_line)
                     ctx_before = ctx_before[-(context + 1):]
             flush_pair()
@@ -273,23 +267,21 @@ def build_code_repair(repo_root: Path, max_commits=3000, context=3, branch="main
 
 # ----------------------- Cleaning -----------------------
 def clean_generic(rows: List[Dict], min_input_chars=40, min_target_chars=8, max_len_bytes=20000) -> List[Dict]:
-    seen = set()
-    cleaned = []
+    seen = set(); cleaned = []
     for r in rows:
-        # choose a field to validate for "input length"
+        # choose input candidate field
         candidate = r.get("input") or r.get("positive") or r.get("query") or ""
         if len(candidate) < min_input_chars:
             continue
         if r["task"] in ("code_summarization", "signature_generation", "code_repair"):
-            if len(r.get("target","")) < min_target_chars:
+            if len(r.get("target", "")) < min_target_chars:
                 continue
         if len(json.dumps(r)) > max_len_bytes:
             continue
         key = (r["task"], r.get("id"))
-        if key in seen:
+        if key in seen: 
             continue
-        seen.add(key)
-        cleaned.append(r)
+        seen.add(key); cleaned.append(r)
     return cleaned
 
 def clean_code_search(rows: List[Dict]) -> List[Dict]:
@@ -297,8 +289,9 @@ def clean_code_search(rows: List[Dict]) -> List[Dict]:
     for r in rows:
         if not r.get("query") or not r.get("positive"):
             continue
-        negs = r.get("negatives") or []
-        negs = [n for n in negs if n.strip() and n.strip() != r["positive"].strip()]
+        pos = dedent_strip(r["positive"])
+        negs = [n for n in (r.get("negatives") or []) if n.strip() and dedent_strip(n) != pos]
+        r["positive"] = pos
         r["negatives"] = negs
         out.append(r)
     return clean_generic(out, min_input_chars=20)
@@ -313,10 +306,7 @@ def clone_repo(repo_url: str, out: Path, depth: int = 0):
         return
     ensure_dir(out.parent)
     print(f"[clone] cloning {repo_url} -> {out} (depth={depth})")
-    if depth and depth > 0:
-        Repo.clone_from(repo_url, out, depth=depth)
-    else:
-        Repo.clone_from(repo_url, out)
+    Repo.clone_from(repo_url, out, depth=depth if depth and depth > 0 else None)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -326,19 +316,17 @@ def main():
     ap.add_argument("--depth", type=int, default=0)
     ap.add_argument("--max-commits", type=int, default=3000)
     ap.add_argument("--steps", nargs="+", default=["summarization","signature","search","repair"],
-                    choices=["summarization","signature","search","repair"])
-    ap.add_argument("--skip-clean", action="store_true", help="export only raw JSONL")
+        choices=["summarization","signature","search","repair"])
+    ap.add_argument("--skip-clean", action="store_true")
+    ap.add_argument("--include-tests-for-repair", action="store_true")
     args = ap.parse_args()
 
-    # dirs
     ensure_dir(DATA_DIR); ensure_dir(RAW_DIR); ensure_dir(MINED_DIR); ensure_dir(CLEAN_DIR)
 
-    # clone
     if not args.no_clone:
         clone_repo(args.repo_url, REPO_DIR, depth=args.depth)
     elif not REPO_DIR.exists():
-        print("[ERROR] --no-clone but data/raw/repo not found", file=sys.stderr)
-        sys.exit(1)
+        print("[ERROR] --no-clone but data/raw/repo not found", file=sys.stderr); sys.exit(1)
 
     # mine raw
     raw_sum = raw_sig = raw_search = raw_rep = []
@@ -352,36 +340,33 @@ def main():
         raw_search = build_code_search(REPO_DIR)
         write_jsonl(MINED_DIR / "code_search_all_raw.jsonl", raw_search)
     if "repair" in args.steps:
-        raw_rep = build_code_repair(REPO_DIR, max_commits=args.max_commits, branch=args.branch)
+        raw_rep = build_code_repair(REPO_DIR, max_commits=args.max_commits, branch=args.branch,
+                                    include_tests=args.include_tests_for_repair)
         write_jsonl(MINED_DIR / "code_repair_all_raw.jsonl", raw_rep)
 
     if args.skip_clean:
-        print("[done] Raw JSONLs written under data/raw/mined/. Skipped cleaning per --skip-clean.")
+        print("[done] Raw JSONLs under data/raw/mined/. Skipped cleaning.")
         return
 
     # clean -> single JSONL per task (no splits)
     if raw_sum:
-        clean_sum = clean_generic(raw_sum, min_input_chars=40, min_target_chars=20)
+        clean_sum = clean_generic(raw_sum, min_input_chars=20, min_target_chars=12)
         write_jsonl(CLEAN_DIR / "code_summarization.jsonl", clean_sum)
         print(f"[clean] summarization: {len(clean_sum)} items")
-
     if raw_sig:
         clean_sig = clean_generic(raw_sig, min_input_chars=40, min_target_chars=6)
         write_jsonl(CLEAN_DIR / "signature_generation.jsonl", clean_sig)
         print(f"[clean] signature_generation: {len(clean_sig)} items")
-
     if raw_search:
         clean_s = clean_code_search(raw_search)
         write_jsonl(CLEAN_DIR / "code_search.jsonl", clean_s)
         print(f"[clean] code_search: {len(clean_s)} items")
-
     if raw_rep:
         rr = [r for r in raw_rep if r.get("input","").strip() and r.get("target","").strip()]
         clean_r = clean_generic(rr, min_input_chars=10, min_target_chars=5, max_len_bytes=40000)
         write_jsonl(CLEAN_DIR / "code_repair.jsonl", clean_r)
         print(f"[clean] code_repair: {len(clean_r)} items")
 
-    print("[done] Clean JSONLs saved under data/clean_data/. Use your trainer to split.")
-
+    print("[done] Clean JSONLs saved under data/clean_data/.")
 if __name__ == "__main__":
     main()
