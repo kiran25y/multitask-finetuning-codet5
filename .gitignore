@@ -1,0 +1,62 @@
+# ====================================
+# Python / FastAPI / ML project .gitignore
+# ====================================
+
+# Virtual environment folders
+venv/
+.venv/
+env/
+ENV/
+
+# Data folders (raw and cleaned data)
+data/
+# If you only want to ignore subfolders but keep the structure, use:
+data/raw/
+data/clean_data/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Environment variables / secrets
+.env
+*.env
+
+# IDE / Editor settings
+.vscode/
+.idea/
+
+# OS-specific junk
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Docker-related
+*.pid
+*.tar
+docker-compose.override.yml
+
+# Node modules (if you ever have a frontend folder)
+node_modules/
+
+# model checkpoints and weights
+checkpoints/
+
+# files not to be tracked
+build_pandas_datasets_working.py  
+
