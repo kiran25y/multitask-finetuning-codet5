@@ -59,7 +59,7 @@ def main():
             datasets[name] = load_json(path)
             print(f"Loaded {len(datasets[name])} samples from {os.path.basename(path)}")
         else:
-            print(f"⚠️ Missing file: {path}")
+            print(f"Missing file: {path}")
 
     # === TOKENIZATION ===
     tokenized_codedoc = tokenize_dataset(datasets["code_docstring"], ["code", "docstring"])
@@ -81,7 +81,7 @@ def main():
     )
 
     w2v_model.save(os.path.join(OUTPUT_DIR, "word2vec.model"))
-    print("✅ Word2Vec model saved.")
+    print("Word2Vec model saved.")
 
     # === FEATURE EXTRACTION ===
     def vectorize(tokens, model):
@@ -92,14 +92,14 @@ def main():
     def save_vectors(name, tokenized_data):
         vectors = [vectorize(tokens, w2v_model) for tokens in tqdm(tokenized_data, desc=f"Vectorizing {name}")]
         np.save(os.path.join(OUTPUT_DIR, f"{name}_vectors.npy"), np.array(vectors))
-        print(f"💾 Saved {name} vectors to {OUTPUT_DIR}/{name}_vectors.npy")
+        print(f"Saved {name} vectors to {OUTPUT_DIR}/{name}_vectors.npy")
 
     save_vectors("code_docstring", tokenized_codedoc)
     save_vectors("commitmsg_code", tokenized_commitmsg)
     save_vectors("buggy_fixed", tokenized_buggyfix)
     save_vectors("signature_body", tokenized_signature)
 
-    print("\n✅ Data preprocessing and feature extraction complete!")
+    print("\nData preprocessing and feature extraction complete!")
 
 if __name__ == "__main__":
     main()
